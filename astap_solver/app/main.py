@@ -77,7 +77,7 @@ def _solution_or_error(img_path: Path, proc_output: str, returncode: int):
     ini_path = img_path.with_suffix(".ini")
     result = _parse_ini(ini_path) if ini_path.exists() else {}
     if result.get("PLTSOLVD") == "T":
-        return _format_solution(result), None
+        return _format_solution(result, img_path), None
     return None, {
         "error": "plate solve failed",
         "astap_error": result.get("ERROR") or proc_output.strip(),
@@ -228,7 +228,46 @@ def _parse_ini(path: Path) -> dict:
     return data
 
 
-def _format_solution(ini: dict) -> dict:
+def _fits_pixel_size_um(img_path: Path):
+    """Read the pixel size (µm) from a FITS primary header, if available.
+
+    FITS headers are 80-char cards in 2880-byte blocks, ending at an END card.
+    We only scan the first blocks looking for XPIXSZ (physical pixel size in
+    microns, already accounting for binning as written by most capture tools).
+    Returns None for non-FITS input or when the keyword is absent.
+    """
+    try:
+        with open(img_path, "rb") as f:
+            head = f.read(2880 * 4)  # a few blocks is plenty for the primary header
+    except OSError:
+        return None
+    if not head.startswith(b"SIMPLE"):
+        return None
+    for i in range(0, len(head), 80):
+        card = head[i:i + 80].decode("ascii", errors="ignore")
+        kw = card[:8].strip()
+        if kw == "END":
+            break
+        if kw in ("XPIXSZ", "PIXSIZE1") and card[8:9] == "=":
+            try:
+                return float(card[9:].split("/")[0].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _deg_to_dms(deg):
+    """Format a positive angle in degrees as 'DDd MMm SS.Ss'."""
+    if deg is None:
+        return None
+    d = int(deg)
+    m_full = (deg - d) * 60
+    m = int(m_full)
+    s = (m_full - m) * 60
+    return f"{d:02d}d {m:02d}m {s:05.2f}s"
+
+
+def _format_solution(ini: dict, img_path: Path = None) -> dict:
     """Turn ASTAP's raw WCS keys into a friendly JSON solution."""
 
     def num(key):
@@ -252,14 +291,28 @@ def _format_solution(ini: dict) -> dict:
             return None
         return abs(cdelt) * 2 * crpix
 
+    fov_w = fov("CDELT1", "CRPIX1")
+    fov_h = fov("CDELT2", "CRPIX2")
+
+    # Pixel size comes from the FITS header (µm). With the solved pixel scale
+    # the focal length follows: f(mm) = 206.265 * pixel_size(µm) / scale(arcsec).
+    pixel_size_um = _fits_pixel_size_um(img_path) if img_path else None
+    focal_length_mm = None
+    if pixel_size_um and pixel_scale:
+        focal_length_mm = 206.265 * pixel_size_um / pixel_scale
+
     return {
         "solved": True,
         "ra_deg": num("CRVAL1"),          # image center right ascension
         "dec_deg": num("CRVAL2"),         # image center declination
         "rotation_deg": num("CROTA2"),    # field rotation
         "pixel_scale_arcsec": pixel_scale,
-        "fov_width_deg": fov("CDELT1", "CRPIX1"),
-        "fov_height_deg": fov("CDELT2", "CRPIX2"),
+        "pixel_size_um": pixel_size_um,
+        "focal_length_mm": focal_length_mm,
+        "fov_width_deg": fov_w,
+        "fov_height_deg": fov_h,
+        "fov_width_dms": _deg_to_dms(fov_w),
+        "fov_height_dms": _deg_to_dms(fov_h),
         "raw": ini,                       # full ASTAP output for advanced use
     }
 
@@ -460,7 +513,10 @@ INDEX_HTML = """<!DOCTYPE html>
       ['RA (deg)', d.ra_deg], ['Dec (deg)', d.dec_deg],
       ['Rotation (deg)', d.rotation_deg],
       ['Pixel scale (arcsec/px)', d.pixel_scale_arcsec],
-      ['FOV width (deg)', d.fov_width_deg], ['FOV height (deg)', d.fov_height_deg],
+      ['Pixel size (µm)', d.pixel_size_um],
+      ['Focal length (mm)', d.focal_length_mm],
+      ['FOV', (d.fov_width_dms && d.fov_height_dms)
+        ? d.fov_width_dms + ' × ' + d.fov_height_dms : null],
     ];
     const fmt = (v) => (v === null || v === undefined) ? '—'
       : (typeof v === 'number' ? v.toFixed(4).replace(/\\.?0+$/, '') : v);

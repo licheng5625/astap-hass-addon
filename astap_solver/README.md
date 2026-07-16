@@ -78,12 +78,21 @@ curl -F "file=@M31.fits" -F "ra=10.68" -F "dec=41.27" -F "fov=1.5" \
   "dec_deg": 41.269,
   "rotation_deg": 179.2,
   "pixel_scale_arcsec": 1.83,
+  "pixel_size_um": 3.76,
+  "focal_length_mm": 423.5,
   "fov_width_deg": 1.51,
   "fov_height_deg": 1.02,
-  "stars_detected": 512,
+  "fov_width_dms": "01d 30m 36.00s",
+  "fov_height_dms": "01d 01m 12.00s",
   "raw": { "PLTSOLVD": "T", "CRVAL1": "10.6847", ... }
 }
 ```
+
+`pixel_size_um` is read from the FITS header (`XPIXSZ`); `focal_length_mm`
+is derived from it and the solved pixel scale
+(`f = 206.265 × pixel_size_µm / pixel_scale_arcsec`). Both are omitted
+(`null`) for non-FITS input or when the header lacks the pixel size. `fov_*_dms`
+give the field of view in degrees-minutes-seconds.
 
 A failed solve returns HTTP **422** with the ASTAP error message.
 
