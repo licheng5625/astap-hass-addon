@@ -45,7 +45,7 @@ install_star_db() {
   while IFS= read -r -d '' f; do
     mv "$f" "${STAR_DB_DIR}/"
     moved=$((moved + 1))
-  done < <(find "${STAGE_DIR}" -type f \( -name "*.290" -o -name "*.1476" -o -name "*.157" \) -print0)
+  done < <(find "${STAGE_DIR}" -type f \( "${STAR_DB_GLOBS[@]}" \) -print0)
 
   rm -rf "${STAGE_DIR}"
 
@@ -57,8 +57,15 @@ install_star_db() {
   return 0
 }
 
+# Star database file extensions vary per catalogue (.290 / .1476 / .157).
+STAR_DB_GLOBS=(-name "*.290" -o -name "*.1476" -o -name "*.157")
+
+star_db_present() {
+  [ -n "$(find "${STAR_DB_DIR}" -maxdepth 1 -type f \( "${STAR_DB_GLOBS[@]}" \) -print -quit 2>/dev/null)" ]
+}
+
 # Only download if this catalogue isn't already present.
-if ls "${STAR_DB_DIR}"/*.290 >/dev/null 2>&1; then
+if star_db_present; then
   bashio::log.info "Star database already present in ${STAR_DB_DIR}."
 else
   if ! install_star_db; then
