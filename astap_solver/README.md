@@ -43,18 +43,20 @@ Pick the star DB by your **field of view**:
 The add-on listens on port **8000**.
 
 ### `GET /health`
-Returns whether ASTAP and a star database are available.
+Returns whether ASTAP and a star database are available, plus the deep sky
+annotation catalogue status (`deepsky_db`, `deepsky_objects`).
 
 ### `POST /solve`
 Multipart form upload.
 
-| Field    | Required | Description                                   |
-|----------|----------|-----------------------------------------------|
-| `file`   | yes      | The image (FITS/JPG/PNG/TIFF)                 |
-| `ra`     | no       | Approx center RA in **degrees** (0–360)       |
-| `dec`    | no       | Approx center Dec in **degrees** (−90..90)    |
-| `fov`    | no       | Field-of-view height in degrees               |
-| `radius` | no       | Search radius in degrees around the ra/dec    |
+| Field      | Required | Description                                        |
+|------------|----------|----------------------------------------------------|
+| `file`     | yes      | The image (FITS/JPG/PNG/TIFF)                      |
+| `ra`       | no       | Approx center RA in **degrees** (0–360)            |
+| `dec`      | no       | Approx center Dec in **degrees** (−90..90)         |
+| `fov`      | no       | Field-of-view height in degrees                    |
+| `radius`   | no       | Search radius in degrees around the ra/dec         |
+| `annotate` | no       | `true` to include known deep sky objects in field  |
 
 Giving `ra`/`dec`/`fov` hints turns a slow blind solve into a ~1–3 s solve.
 
@@ -93,6 +95,41 @@ is derived from it and the solved pixel scale
 (`f = 206.265 × pixel_size_µm / pixel_scale_arcsec`). Both are omitted
 (`null`) for non-FITS input or when the header lacks the pixel size. `fov_*_dms`
 give the field of view in degrees-minutes-seconds.
+
+A failed solve returns HTTP **422** with the ASTAP error message.
+
+### Deep sky annotation
+
+With `annotate=true`, the response gains an `objects` array listing catalogued
+deep sky objects whose centre falls within the solved field, ordered by
+distance from the field centre (so `objects[0]` is the best "primary target"
+candidate):
+
+```json
+{
+  "solved": true,
+  "ra_deg": 85.24, "dec_deg": -2.46, "fov_width_deg": 1.5,
+  "objects": [
+    { "name": "IC434", "ra_deg": 85.25, "dec_deg": -2.453, "size_arcmin": 60 },
+    { "name": "NGC2024/Tank_Track_Nebula/Sh2-277", "ra_deg": 85.425, "dec_deg": -1.857, "size_arcmin": 30 }
+  ]
+}
+```
+
+Notes:
+
+- `name` carries the catalogue's aliases joined by `/` (e.g.
+  `M42/NGC1976/Orion_Nebula`); take the part before the first `/` for a short
+  label.
+- `size_arcmin` is the object's major-axis size; omitted for point-like entries.
+- There is **no `type` field** — ASTAP's `deep_sky.csv` does not classify object
+  types, so it cannot be reported reliably.
+- `objects` is only present when `annotate=true`, and is `[]` when nothing is in
+  field. Annotation never fails a solve: a missing catalogue just yields `[]`.
+- Matching is done by the add-on itself (gnomonic projection about the field
+  centre) from ASTAP's `deep_sky.csv` (~30 000 objects, baked into the image).
+  ASTAP's own `-annotate` flag is **not** used — it exists only in the GUI build,
+  not `astap_cli`, and only renders a labelled JPEG.
 
 A failed solve returns HTTP **422** with the ASTAP error message.
 

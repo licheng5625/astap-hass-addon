@@ -18,12 +18,141 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.3.1")
+app = FastAPI(title="ASTAP Plate Solver", version="0.4.0")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
 DEFAULT_FOV = float(os.environ.get("DEFAULT_FOV", "0") or 0)
 ASTAP_BIN = "/usr/bin/astap_cli"
+# ASTAP's deep sky object catalogue, baked into the image at build time.
+DEEPSKY_CSV = os.environ.get("DEEPSKY_CSV", "/opt/astap/deep_sky.csv")
+
+
+# --- Deep sky object annotation --------------------------------------------
+# ASTAP's own -annotate flag exists only in the GUI build (not astap_cli) and
+# merely renders a labelled JPEG, so we do the in-field lookup ourselves from
+# ASTAP's catalogue file. The CSV holds ~30k objects, one per line:
+#
+#   RA[0..864000], DEC[-324000..324000], name(s), length[0.1'], width[0.1'], orientation[deg]
+#
+# RA is in 1/2400 degree units (864000/360), DEC in arc-seconds offset such
+# that 324000 == +90 deg. Names carry aliases separated by "/". The size and
+# orientation columns are optional (point-like objects omit them).
+
+# Loaded once at startup: list of dicts {name, ra_deg, dec_deg, size_arcmin}.
+_DEEPSKY_OBJECTS: list = []
+
+
+def _load_deepsky(path: str = DEEPSKY_CSV) -> list:
+    """Parse ASTAP's deep_sky.csv into a list of catalogue objects.
+
+    Returns an empty list if the file is missing or unreadable so that a
+    missing database only disables annotation, never breaks solving.
+    """
+    objects = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return objects
+
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) < 3:
+            continue
+        try:
+            ra_raw = int(parts[0])
+            dec_raw = int(parts[1])
+        except ValueError:
+            # Header lines and any malformed rows are skipped.
+            continue
+        name = parts[2].strip()
+        if not name:
+            continue
+        # length/width are in 0.1-arcmin units; use the larger as the object
+        # size (major axis). Absent for point-like entries.
+        size_arcmin = None
+        dims = []
+        for col in parts[3:5]:
+            try:
+                dims.append(int(col) / 10.0)
+            except ValueError:
+                pass
+        if dims:
+            size_arcmin = max(dims)
+
+        objects.append({
+            "name": name,
+            "ra_deg": ra_raw / 2400.0,       # 864000 units == 360 deg
+            "dec_deg": dec_raw / 3600.0,     # arc-seconds; 324000 == 90 deg
+            "size_arcmin": size_arcmin,
+        })
+    return objects
+
+
+def _find_objects_in_field(ra_deg, dec_deg, fov_w_deg, fov_h_deg) -> list:
+    """Return catalogue objects whose centre falls within the solved field.
+
+    Uses a gnomonic (tangent-plane) projection about the field centre and keeps
+    objects landing inside the half-width/half-height rectangle, plus a small
+    margin so large objects straddling the edge are still reported.
+    """
+    if ra_deg is None or dec_deg is None or not _DEEPSKY_OBJECTS:
+        return []
+
+    fov_w = fov_w_deg or fov_h_deg
+    fov_h = fov_h_deg or fov_w_deg
+    if not fov_w or not fov_h:
+        return []
+
+    half_w = fov_w / 2.0
+    half_h = fov_h / 2.0
+    dec0 = math.radians(dec_deg)
+    sin_dec0, cos_dec0 = math.sin(dec0), math.cos(dec0)
+
+    found = []
+    for obj in _DEEPSKY_OBJECTS:
+        d = math.radians(obj["dec_deg"])
+        dra = math.radians(obj["ra_deg"] - ra_deg)
+        # Normalise RA difference into [-180, 180] to handle the 0/360 wrap.
+        while dra > math.pi:
+            dra -= 2 * math.pi
+        while dra < -math.pi:
+            dra += 2 * math.pi
+
+        sin_d, cos_d = math.sin(d), math.cos(d)
+        cos_c = sin_dec0 * sin_d + cos_dec0 * cos_d * math.cos(dra)
+        if cos_c <= 0:
+            continue  # more than 90 deg away — behind the tangent plane
+        # Standard coordinates (degrees) on the tangent plane.
+        xi = math.degrees(cos_d * math.sin(dra) / cos_c)
+        eta = math.degrees(
+            (cos_dec0 * sin_d - sin_dec0 * cos_d * math.cos(dra)) / cos_c
+        )
+
+        # Allow half the object's own size as edge margin so big nebulae that
+        # overlap the frame edge still count as "in field".
+        margin = (obj["size_arcmin"] or 0) / 60.0 / 2.0
+        if abs(xi) <= half_w + margin and abs(eta) <= half_h + margin:
+            entry = {
+                "name": obj["name"],
+                "ra_deg": round(obj["ra_deg"], 5),
+                "dec_deg": round(obj["dec_deg"], 5),
+            }
+            if obj["size_arcmin"] is not None:
+                entry["size_arcmin"] = obj["size_arcmin"]
+            # Distance from centre (deg) drives ordering / "primary" selection.
+            entry["_sep_deg"] = math.hypot(xi, eta)
+            found.append(entry)
+
+    # Closest to centre first; strip the internal sort key before returning.
+    found.sort(key=lambda e: e["_sep_deg"])
+    for e in found:
+        e.pop("_sep_deg", None)
+    return found
+
+
+# Load the catalogue once, at import time.
+_DEEPSKY_OBJECTS = _load_deepsky()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -51,6 +180,9 @@ def health():
         "astap": has_bin,
         "star_db_dir": STAR_DB_DIR,
         "star_db_files": len(db_files),
+        # Deep sky annotation catalogue (baked into the image).
+        "deepsky_db": Path(DEEPSKY_CSV).exists(),
+        "deepsky_objects": len(_DEEPSKY_OBJECTS),
     }
 
 
@@ -72,12 +204,13 @@ def _build_cmd(img_path: Path, ra, dec, fov, radius) -> list:
     return cmd
 
 
-def _solution_or_error(img_path: Path, proc_output: str, returncode: int):
+def _solution_or_error(img_path: Path, proc_output: str, returncode: int,
+                       annotate: bool = False):
     """Read ASTAP's sidecar .ini and return (solution, error). One is None."""
     ini_path = img_path.with_suffix(".ini")
     result = _parse_ini(ini_path) if ini_path.exists() else {}
     if result.get("PLTSOLVD") == "T":
-        return _format_solution(result, img_path), None
+        return _format_solution(result, img_path, annotate), None
     return None, {
         "error": "plate solve failed",
         "astap_error": result.get("ERROR") or proc_output.strip(),
@@ -92,6 +225,7 @@ async def solve(
     dec: float | None = Form(None),
     fov: float | None = Form(None),
     radius: float | None = Form(None),
+    annotate: bool = Form(False),
 ):
     """Solve one uploaded image (single request; best for the LAN API).
 
@@ -99,6 +233,8 @@ async def solve(
     - ``ra`` / ``dec``: approximate center in degrees (0-360 / -90..90).
     - ``fov``: field-of-view height in degrees.
     - ``radius``: search radius in degrees around the ra/dec hint.
+    - ``annotate``: when true, include known deep sky objects that fall within
+      the solved field under an ``objects`` array.
 
     Note: through Home Assistant Ingress the request body is capped at ~1 MB,
     so large FITS files must use the chunked ``/upload`` + ``/solve_stream``
@@ -116,7 +252,7 @@ async def solve(
             raise HTTPException(504, "ASTAP solve timed out after 180s")
 
         solution, error = _solution_or_error(
-            img_path, proc.stdout or proc.stderr, proc.returncode
+            img_path, proc.stdout or proc.stderr, proc.returncode, annotate
         )
         if error:
             raise HTTPException(422, error)
@@ -164,6 +300,7 @@ async def solve_stream(
     dec: float | None = Form(None),
     fov: float | None = Form(None),
     radius: float | None = Form(None),
+    annotate: bool = Form(False),
 ):
     """Solve a previously uploaded (chunked) file, streaming ASTAP's log.
 
@@ -201,7 +338,7 @@ async def solve_stream(
                 return
 
             solution, error = _solution_or_error(
-                img_path, "\n".join(captured), proc.returncode
+                img_path, "\n".join(captured), proc.returncode, annotate
             )
             if error:
                 yield json.dumps({"type": "error", **error}) + "\n"
@@ -267,7 +404,7 @@ def _deg_to_dms(deg):
     return f"{d:02d}d {m:02d}m {s:05.2f}s"
 
 
-def _format_solution(ini: dict, img_path: Path = None) -> dict:
+def _format_solution(ini: dict, img_path: Path = None, annotate: bool = False) -> dict:
     """Turn ASTAP's raw WCS keys into a friendly JSON solution."""
 
     def num(key):
@@ -301,10 +438,12 @@ def _format_solution(ini: dict, img_path: Path = None) -> dict:
     if pixel_size_um and pixel_scale:
         focal_length_mm = 206.265 * pixel_size_um / pixel_scale
 
-    return {
+    ra_center, dec_center = num("CRVAL1"), num("CRVAL2")
+
+    solution = {
         "solved": True,
-        "ra_deg": num("CRVAL1"),          # image center right ascension
-        "dec_deg": num("CRVAL2"),         # image center declination
+        "ra_deg": ra_center,              # image center right ascension
+        "dec_deg": dec_center,            # image center declination
         "rotation_deg": num("CROTA2"),    # field rotation
         "pixel_scale_arcsec": pixel_scale,
         "pixel_size_um": pixel_size_um,
@@ -315,6 +454,13 @@ def _format_solution(ini: dict, img_path: Path = None) -> dict:
         "fov_height_dms": _deg_to_dms(fov_h),
         "raw": ini,                       # full ASTAP output for advanced use
     }
+    # Deep sky objects falling inside the solved field. Best-effort: a missing
+    # catalogue or absent FOV just yields an empty list, never a solve failure.
+    if annotate:
+        solution["objects"] = _find_objects_in_field(
+            ra_center, dec_center, fov_w, fov_h
+        )
+    return solution
 
 
 INDEX_HTML = """<!DOCTYPE html>
@@ -367,6 +513,11 @@ INDEX_HTML = """<!DOCTYPE html>
     <div><label>Search radius (deg)</label><input type="number" id="radius" step="any" placeholder="optional"></div>
   </div>
 
+  <label style="display:flex; align-items:center; gap:8px; margin:0 0 16px; cursor:pointer">
+    <input type="checkbox" id="annotate" checked style="width:auto">
+    <span>Identify deep sky objects in field</span>
+  </label>
+
   <button id="solve" disabled>Solve</button>
   <p class="muted" id="progress"></p>
   <pre id="log" style="display:none; max-height:220px; overflow-y:auto; font-size:.8rem"></pre>
@@ -381,7 +532,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
   fetch('health').then(r => r.json()).then(h => {
     $('status').textContent = h.status === 'ok'
-      ? `solver ready · ${h.star_db_files} star-db files`
+      ? `solver ready · ${h.star_db_files} star-db files · ${h.deepsky_objects || 0} DSO catalogue`
       : `⚠ degraded · astap=${h.astap} · star-db files=${h.star_db_files}`;
     $('status').className = h.status === 'ok' ? 'muted' : 'err';
   }).catch(() => { $('status').textContent = 'cannot reach API'; });
@@ -462,6 +613,7 @@ INDEX_HTML = """<!DOCTYPE html>
         const v = $(k).value.trim();
         if (v !== '') fd.append(k, v);
       }
+      if ($('annotate').checked) fd.append('annotate', 'true');
       const resp = await fetch('solve_stream', { method: 'POST', body: fd });
       if (!resp.ok && !resp.body) {
         const txt = await resp.text();
@@ -520,8 +672,22 @@ INDEX_HTML = """<!DOCTYPE html>
     ];
     const fmt = (v) => (v === null || v === undefined) ? '—'
       : (typeof v === 'number' ? v.toFixed(4).replace(/\\.?0+$/, '') : v);
-    $('out').innerHTML = rows.map(([k, v]) =>
-      `<div class="row"><span>${k}</span><b>${fmt(v)}</b></div>`).join('')
+    let html = rows.map(([k, v]) =>
+      `<div class="row"><span>${k}</span><b>${fmt(v)}</b></div>`).join('');
+
+    // Deep sky objects in the field (when annotation was requested).
+    if (Array.isArray(d.objects)) {
+      if (d.objects.length) {
+        const names = d.objects.map(o => o.name.split('/')[0]).join(' · ');
+        html += '<div class="row"><span>Objects in field</span><b>'
+          + d.objects.length + '</b></div>'
+          + '<div class="muted" style="padding:8px 0">' + names + '</div>';
+      } else {
+        html += '<div class="row"><span>Objects in field</span><b>none</b></div>';
+      }
+    }
+
+    $('out').innerHTML = html
       + '<details style="margin-top:14px"><summary class="muted">raw ASTAP output</summary>'
       + '<pre>' + JSON.stringify(d.raw, null, 2) + '</pre></details>';
   }
