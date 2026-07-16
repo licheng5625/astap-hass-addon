@@ -13,6 +13,8 @@ RUN apk add --no-cache \
       py3-pip \
       curl \
       unzip \
+      binutils \
+      tar \
       libgcc \
       libstdc++
 
