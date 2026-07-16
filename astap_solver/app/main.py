@@ -18,7 +18,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.3.0")
+app = FastAPI(title="ASTAP Plate Solver", version="0.3.1")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
@@ -243,15 +243,23 @@ def _format_solution(ini: dict) -> dict:
     if cd1_1 is not None and cd1_2 is not None:
         pixel_scale = math.hypot(cd1_1, cd1_2) * 3600.0
 
+    # ASTAP's .ini has no explicit FOV/size keys, so derive the field of view
+    # from the plate scale (CDELT, deg/pixel) times the image dimensions. The
+    # reference pixel CRPIX sits at the image centre, so width/height ≈ 2*CRPIX.
+    def fov(cdelt_key, crpix_key):
+        cdelt, crpix = num(cdelt_key), num(crpix_key)
+        if cdelt is None or crpix is None:
+            return None
+        return abs(cdelt) * 2 * crpix
+
     return {
         "solved": True,
         "ra_deg": num("CRVAL1"),          # image center right ascension
         "dec_deg": num("CRVAL2"),         # image center declination
         "rotation_deg": num("CROTA2"),    # field rotation
         "pixel_scale_arcsec": pixel_scale,
-        "fov_width_deg": num("FOV_W") or num("CDELT1"),
-        "fov_height_deg": num("FOV_H") or num("CDELT2"),
-        "stars_detected": num("STARS"),
+        "fov_width_deg": fov("CDELT1", "CRPIX1"),
+        "fov_height_deg": fov("CDELT2", "CRPIX2"),
         "raw": ini,                       # full ASTAP output for advanced use
     }
 
@@ -453,7 +461,6 @@ INDEX_HTML = """<!DOCTYPE html>
       ['Rotation (deg)', d.rotation_deg],
       ['Pixel scale (arcsec/px)', d.pixel_scale_arcsec],
       ['FOV width (deg)', d.fov_width_deg], ['FOV height (deg)', d.fov_height_deg],
-      ['Stars detected', d.stars_detected],
     ];
     const fmt = (v) => (v === null || v === undefined) ? '—'
       : (typeof v === 'number' ? v.toFixed(4).replace(/\\.?0+$/, '') : v);
