@@ -24,7 +24,54 @@ and API details.
 
 [`remote_solve.py`](./remote_solve.py) solves an image from anywhere through
 your Home Assistant Cloud (Nabu Casa) URL — no VPN, no exposed ports, no
-reverse proxy. It uses only the Python standard library.
+reverse proxy. It uses only the Python standard library (no `pip install`).
+
+### Quick start
+
+```bash
+export HASS_URL="https://xxxxx.ui.nabu.casa"   # your Nabu Casa remote URL
+export HASS_TOKEN="ey..."                       # long-lived access token
+python3 remote_solve.py M31.fits --ra 10.68 --dec 41.27 --fov 1.5
+```
+
+Output is the JSON solution (center RA/Dec, rotation, pixel scale) on stdout.
+
+### Getting the values you need
+
+- **`HASS_URL`** — your Home Assistant Cloud remote URL. Find it under
+  **Settings → Home Assistant Cloud → Remote Control** (looks like
+  `https://<random>.ui.nabu.casa`).
+- **`HASS_TOKEN`** — a Long-Lived Access Token. Click your **user profile**
+  (bottom-left avatar) → scroll to **Long-Lived Access Tokens** → **Create
+  Token**. Copy it once; it is not shown again.
+- **add-on slug** — `remote_solve.py` defaults to the slug on the author's
+  install (`d5d3ad43_astap_solver`). The `d5d3ad43_` prefix is unique per
+  Home Assistant instance, so on your install pass `--slug` with your own.
+  The script itself resolves the dynamic `ingress_url` from the slug, so you
+  only need the slug, not the full URL. To find your slug, open the add-on in
+  the UI — it is the last path segment of the add-on page URL
+  (`.../hassio/addon/<slug>/info`), e.g. `abcd1234_astap_solver`.
+
+  ```bash
+  python3 remote_solve.py M31.fits --slug abcd1234_astap_solver
+  ```
+
+### Options
+
+| Flag        | Meaning                                   |
+|-------------|-------------------------------------------|
+| `--ra`      | RA hint in degrees (0–360)                |
+| `--dec`     | Dec hint in degrees (−90..90)             |
+| `--fov`     | Field-of-view height in degrees           |
+| `--radius`  | Search radius in degrees around the hint  |
+| `--slug`    | Add-on slug (see above)                   |
+| `--url`     | HA base URL (overrides `$HASS_URL`)       |
+| `--token`   | Token (overrides `$HASS_TOKEN`)           |
+
+Hints are optional — without them the solver does a full-sky blind solve
+(slower). With `--ra/--dec/--fov` a solve typically finishes in ~1–5 s.
+
+### How it works
 
 The add-on's `ingress_stream: true` lets full-size FITS files (tens of MB)
 through ingress, and the script obtains an ingress session over the HA
@@ -37,12 +84,22 @@ WebSocket API (which accepts a normal Long-Lived Access Token):
 3. Resolve the add-on's dynamic `ingress_url` (this is **not** the slug).
 4. `POST` the image to `<ingress_url>/solve` with the `ingress_session` cookie.
 
+> Treat the token like a password — it grants full access to your Home
+> Assistant. Keep it out of shell history and version control. If it leaks,
+> revoke it under your profile's Long-Lived Access Tokens and create a new one.
+
+## Local solving (same network)
+
+On the same LAN you don't need any of the above — hit the add-on's port
+directly (no ingress, no size limit):
+
 ```bash
-export HASS_URL="https://xxxxx.ui.nabu.casa"
-export HASS_TOKEN="ey..."         # long-lived access token
-python3 remote_solve.py M31.fits --ra 10.68 --dec 41.27 --fov 1.5
+# Web UI in a browser
+http://<home-assistant-ip>:8000
+
+# API from a script
+curl -F "file=@M31.fits" -F "ra=10.68" -F "dec=41.27" -F "fov=1.5" \
+     http://<home-assistant-ip>:8000/solve
 ```
 
-> Treat the token like a password — it grants full access to your Home
-> Assistant. Keep it out of shell history and version control.
 
