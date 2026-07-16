@@ -15,6 +15,8 @@ RUN apk add --no-cache \
       unzip \
       binutils \
       tar \
+      xz \
+      zstd \
       libgcc \
       libstdc++
 
