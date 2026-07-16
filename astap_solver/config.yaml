@@ -1,5 +1,5 @@
 name: ASTAP Plate Solver
-version: "0.2.0"
+version: "0.2.1"
 slug: astap_solver
 description: >-
   Local astrometric plate solving for FITS/JPG/PNG images using ASTAP.

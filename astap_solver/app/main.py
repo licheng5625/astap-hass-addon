@@ -18,7 +18,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.2.0")
+app = FastAPI(title="ASTAP Plate Solver", version="0.2.1")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
@@ -346,15 +346,21 @@ INDEX_HTML = """<!DOCTYPE html>
   // chunks, then stream the solve log. Works both behind ingress and on LAN.
   const CHUNK = 512 * 1024;   // 512 KB, safely under the ingress limit
 
-  let timer = null, t0 = 0;
-  function startTimer(prefix) {
-    t0 = Date.now();
-    clearInterval(timer);
-    timer = setInterval(() => {
-      $('progress').textContent = prefix + ' · ' +
-        ((Date.now() - t0) / 1000).toFixed(1) + 's';
-    }, 100);
+  // The timer ticks every 100ms; `phase` holds the current detail (e.g.
+  // "Uploading 20/98 chunks") so the tick appends elapsed time without the
+  // two writers overwriting each other.
+  let timer = null, t0 = 0, phase = '';
+  function paintProgress() {
+    $('progress').textContent = phase + ' · ' + ((Date.now() - t0) / 1000).toFixed(1) + 's';
   }
+  function startTimer(label) {
+    t0 = Date.now();
+    phase = label;
+    clearInterval(timer);
+    paintProgress();
+    timer = setInterval(paintProgress, 100);
+  }
+  function setPhase(label) { phase = label; paintProgress(); }
   function stopTimer(msg) { clearInterval(timer); $('progress').textContent = msg || ''; }
 
   function newUploadId() {
@@ -383,7 +389,7 @@ INDEX_HTML = """<!DOCTYPE html>
         fd.append('chunk', blob, 'chunk');
         const r = await fetch('upload', { method: 'POST', body: fd });
         if (!r.ok) throw new Error('upload failed at chunk ' + i);
-        $('progress').textContent = `Uploading · ${i + 1}/${total} chunks`;
+        setPhase(`Uploading ${i + 1}/${total} chunks`);
       }
 
       // --- 2. streaming solve ---
