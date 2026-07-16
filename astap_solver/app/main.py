@@ -16,7 +16,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.1.2")
+app = FastAPI(title="ASTAP Plate Solver", version="0.1.3")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
