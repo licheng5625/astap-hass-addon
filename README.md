@@ -19,3 +19,30 @@ FITS/JPG/PNG image over HTTP and get back image-center **RA/Dec**, field
 
 See the [add-on README](./astap_solver/README.md) for install, configuration,
 and API details.
+
+## Remote solving via Nabu Casa
+
+[`remote_solve.py`](./remote_solve.py) solves an image from anywhere through
+your Home Assistant Cloud (Nabu Casa) URL — no VPN, no exposed ports, no
+reverse proxy. It uses only the Python standard library.
+
+The add-on's `ingress_stream: true` lets full-size FITS files (tens of MB)
+through ingress, and the script obtains an ingress session over the HA
+WebSocket API (which accepts a normal Long-Lived Access Token):
+
+1. Authenticate to `/api/websocket` with the token.
+2. Ask HA Core to proxy a Supervisor request for an ingress session
+   (`supervisor/api` → `/ingress/session`) — works with a non-admin token
+   because HA Core makes the Supervisor call with its own privileges.
+3. Resolve the add-on's dynamic `ingress_url` (this is **not** the slug).
+4. `POST` the image to `<ingress_url>/solve` with the `ingress_session` cookie.
+
+```bash
+export HASS_URL="https://xxxxx.ui.nabu.casa"
+export HASS_TOKEN="ey..."         # long-lived access token
+python3 remote_solve.py M31.fits --ra 10.68 --dec 41.27 --fov 1.5
+```
+
+> Treat the token like a password — it grants full access to your Home
+> Assistant. Keep it out of shell history and version control.
+

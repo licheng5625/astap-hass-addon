@@ -1,5 +1,5 @@
 name: ASTAP Plate Solver
-version: "0.2.1"
+version: "0.3.0"
 slug: astap_solver
 description: >-
   Local astrometric plate solving for FITS/JPG/PNG images using ASTAP.
@@ -11,6 +11,7 @@ arch:
 init: false
 ingress: true
 ingress_port: 8000
+ingress_stream: true
 panel_icon: mdi:telescope
 ports:
   8000/tcp: 8000
