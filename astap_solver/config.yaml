@@ -1,0 +1,27 @@
+name: ASTAP Plate Solver
+version: "0.1.0"
+slug: astap_solver
+description: >-
+  Local astrometric plate solving for FITS/JPG/PNG images using ASTAP.
+  Upload an image over HTTP and get back RA/Dec, rotation and pixel scale.
+url: https://github.com/yourname/astap-hass-addon
+arch:
+  - aarch64
+  - amd64
+init: false
+ingress: false
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: ASTAP solver HTTP API
+map:
+  - share:rw
+options:
+  star_db: d50
+  search_radius: 30
+  default_fov: 0
+schema:
+  star_db: list(d05|d20|d50|d80|w08|h17|h18)
+  search_radius: int(0,180)
+  default_fov: float(0,90)
+image: "yourname/astap-solver-{arch}"
