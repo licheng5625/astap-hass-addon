@@ -1,5 +1,5 @@
 name: ASTAP Plate Solver
-version: "0.4.0"
+version: "0.4.1"
 slug: astap_solver
 description: >-
   Local astrometric plate solving for FITS/JPG/PNG images using ASTAP.
@@ -23,7 +23,9 @@ options:
   star_db: d50
   search_radius: 30
   default_fov: 0
+  solve_timeout: 600
 schema:
   star_db: list(d05|d20|d50|d80|w08|h17|h18)
   search_radius: int(0,180)
   default_fov: float(0,90)
+  solve_timeout: int(30,3600)

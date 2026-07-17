@@ -26,6 +26,7 @@ solve images from HA automations / scripts / Node-RED without a separate host.
 star_db: d50          # d05 | d20 | d50 | d80 | w08 | h17 | h18
 search_radius: 30     # degrees, for hinted solves
 default_fov: 0         # field-of-view height in degrees; 0 = let ASTAP guess
+solve_timeout: 600     # seconds before a solve is aborted (504)
 ```
 
 Pick the star DB by your **field of view**:

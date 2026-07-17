@@ -11,14 +11,13 @@ import asyncio
 import json
 import math
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.4.0")
+app = FastAPI(title="ASTAP Plate Solver", version="0.4.1")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
@@ -26,6 +25,34 @@ DEFAULT_FOV = float(os.environ.get("DEFAULT_FOV", "0") or 0)
 ASTAP_BIN = "/usr/bin/astap_cli"
 # ASTAP's deep sky object catalogue, baked into the image at build time.
 DEEPSKY_CSV = os.environ.get("DEEPSKY_CSV", "/opt/astap/deep_sky.csv")
+
+# A solve on a slow host (Raspberry Pi) or a blind solve of a large image can
+# take several minutes, so allow a generous timeout. Configurable via the
+# add-on options (solve_timeout) through this env var.
+SOLVE_TIMEOUT = int(os.environ.get("SOLVE_TIMEOUT", "600") or 600)
+
+
+async def _run_astap(cmd: list, timeout: int = SOLVE_TIMEOUT) -> tuple:
+    """Run astap_cli without blocking the event loop. Returns (output, rc).
+
+    Using an async subprocess (not the blocking subprocess.run) is essential:
+    the endpoints are ``async def``, so a blocking call would stall the whole
+    event loop and make concurrent requests pile up and time out.
+
+    Raises asyncio.TimeoutError if the solve exceeds ``timeout`` seconds.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return stdout.decode(errors="ignore"), proc.returncode
 
 
 # --- Deep sky object annotation --------------------------------------------
@@ -247,12 +274,12 @@ async def solve(
 
         cmd = _build_cmd(img_path, ra, dec, fov, radius)
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(504, "ASTAP solve timed out after 180s")
+            output, returncode = await _run_astap(cmd)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, f"ASTAP solve timed out after {SOLVE_TIMEOUT}s")
 
         solution, error = _solution_or_error(
-            img_path, proc.stdout or proc.stderr, proc.returncode, annotate
+            img_path, output, returncode, annotate
         )
         if error:
             raise HTTPException(422, error)
@@ -324,7 +351,9 @@ async def solve_stream(
             captured = []
             try:
                 while True:
-                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=180)
+                    raw = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=SOLVE_TIMEOUT
+                    )
                     if not raw:
                         break
                     line = raw.decode(errors="ignore").rstrip()
@@ -334,7 +363,7 @@ async def solve_stream(
                 await proc.wait()
             except asyncio.TimeoutError:
                 proc.kill()
-                yield json.dumps({"type": "error", "message": "solve timed out after 180s"}) + "\n"
+                yield json.dumps({"type": "error", "message": f"solve timed out after {SOLVE_TIMEOUT}s"}) + "\n"
                 return
 
             solution, error = _solution_or_error(

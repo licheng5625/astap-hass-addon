@@ -78,6 +78,7 @@ fi
 export STAR_DB_DIR
 export SEARCH_RADIUS="$(bashio::config 'search_radius')"
 export DEFAULT_FOV="$(bashio::config 'default_fov')"
+export SOLVE_TIMEOUT="$(bashio::config 'solve_timeout')"
 
 bashio::log.info "Starting ASTAP solver API on :8000"
 cd /app
