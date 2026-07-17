@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("astap")
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.4.3")
+app = FastAPI(title="ASTAP Plate Solver", version="0.4.4")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
@@ -51,6 +51,14 @@ def _next_request_id() -> int:
     global _request_seq
     _request_seq += 1
     return _request_seq
+
+
+def _effective_timeout(requested: float | None) -> int:
+    """Per-request timeout wins over the configured default, clamped to sane
+    bounds so a bad value can't disable the timeout entirely."""
+    if requested is None or requested <= 0:
+        return SOLVE_TIMEOUT
+    return max(5, min(int(requested), 3600))
 
 
 async def _run_astap(cmd: list, timeout: int = SOLVE_TIMEOUT) -> tuple:
@@ -293,6 +301,7 @@ async def solve(
     fov: float | None = Form(None),
     radius: float | None = Form(None),
     annotate: bool = Form(False),
+    timeout: float | None = Form(None),
 ):
     """Solve one uploaded image (single request; best for the LAN API).
 
@@ -302,26 +311,32 @@ async def solve(
     - ``radius``: search radius in degrees around the ra/dec hint.
     - ``annotate``: when true, include known deep sky objects that fall within
       the solved field under an ``objects`` array.
+    - ``timeout``: per-request solve timeout in seconds (overrides the add-on
+      default; clamped to 5..3600). The client should set this to its own
+      request timeout so an unsolvable image is abandoned in step, not left
+      running for the full default.
 
     Note: through Home Assistant Ingress the request body is capped at ~1 MB,
     so large FITS files must use the chunked ``/upload`` + ``/solve_stream``
     flow (used by the web UI) or the direct LAN port.
     """
+    solve_timeout = _effective_timeout(timeout)
     suffix = Path(file.filename or "image.fits").suffix or ".fits"
     with tempfile.TemporaryDirectory() as tmp:
         img_path = Path(tmp) / f"input{suffix}"
         data = await file.read()
         img_path.write_bytes(data)
         LOGGER.info(
-            "/solve received '%s' (%.1f MB), hints ra=%s dec=%s fov=%s annotate=%s",
-            file.filename, len(data) / 1e6, ra, dec, fov, annotate,
+            "/solve received '%s' (%.1f MB), hints ra=%s dec=%s fov=%s "
+            "annotate=%s timeout=%ss",
+            file.filename, len(data) / 1e6, ra, dec, fov, annotate, solve_timeout,
         )
 
         cmd = _build_cmd(img_path, ra, dec, fov, radius)
         try:
-            output, returncode = await _run_astap(cmd)
+            output, returncode = await _run_astap(cmd, solve_timeout)
         except asyncio.TimeoutError:
-            raise HTTPException(504, f"ASTAP solve timed out after {SOLVE_TIMEOUT}s")
+            raise HTTPException(504, f"ASTAP solve timed out after {solve_timeout}s")
 
         solution, error = _solution_or_error(
             img_path, output, returncode, annotate
@@ -381,24 +396,27 @@ async def solve_stream(
     fov: float | None = Form(None),
     radius: float | None = Form(None),
     annotate: bool = Form(False),
+    timeout: float | None = Form(None),
 ):
     """Solve a previously uploaded (chunked) file, streaming ASTAP's log.
 
     Returns newline-delimited JSON: ``{"type":"log","line":...}`` per output
     line, then a final ``{"type":"result",...}`` or ``{"type":"error",...}``.
+    ``timeout`` (seconds) overrides the add-on default, clamped to 5..3600.
     """
     d = _upload_dir(upload_id)
     suffix = Path(filename).suffix or ".fits"
     img_path = d / f"input{suffix}"
     if not img_path.exists():
         raise HTTPException(404, "no uploaded file for this upload_id")
+    solve_timeout = _effective_timeout(timeout)
     rid = _next_request_id()
     blind = ra is None or dec is None
     LOGGER.info(
         "[#%d] /solve_stream '%s' (%.1f MB) id=%s hints ra=%s dec=%s fov=%s "
-        "radius=%s annotate=%s %s",
+        "radius=%s annotate=%s timeout=%ss %s",
         rid, filename, img_path.stat().st_size / 1e6, upload_id, ra, dec, fov,
-        radius, annotate, "BLIND-SOLVE" if blind else "hinted",
+        radius, annotate, solve_timeout, "BLIND-SOLVE" if blind else "hinted",
     )
 
     async def stream():
@@ -419,8 +437,14 @@ async def solve_stream(
             captured = []
             try:
                 while True:
+                    # Bound each read by the time left in the overall budget, so
+                    # a solve that keeps dribbling progress lines still stops at
+                    # the deadline rather than running indefinitely.
+                    remaining = solve_timeout - (time.monotonic() - start)
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
                     raw = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=SOLVE_TIMEOUT
+                        proc.stdout.readline(), timeout=remaining
                     )
                     if not raw:
                         break
@@ -432,8 +456,8 @@ async def solve_stream(
                 await proc.wait()
             except asyncio.TimeoutError:
                 LOGGER.warning("[#%d] timed out after %ss, killing pid=%d",
-                               rid, SOLVE_TIMEOUT, proc.pid)
-                yield json.dumps({"type": "error", "message": f"solve timed out after {SOLVE_TIMEOUT}s"}) + "\n"
+                               rid, solve_timeout, proc.pid)
+                yield json.dumps({"type": "error", "message": f"solve timed out after {solve_timeout}s"}) + "\n"
                 return
 
             LOGGER.info("[#%d] ASTAP finished rc=%s in %.1fs", rid,

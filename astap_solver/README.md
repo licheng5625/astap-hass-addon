@@ -58,6 +58,7 @@ Multipart form upload.
 | `fov`      | no       | Field-of-view height in degrees                    |
 | `radius`   | no       | Search radius in degrees around the ra/dec         |
 | `annotate` | no       | `true` to include known deep sky objects in field  |
+| `timeout`  | no       | Per-request solve timeout in seconds (5–3600). Set this to the client's own request timeout so an unsolvable image is dropped in step instead of running for the full default. |
 
 Giving `ra`/`dec`/`fov` hints turns a slow blind solve into a ~1–3 s solve.
 
