@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("astap")
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.4.2")
+app = FastAPI(title="ASTAP Plate Solver", version="0.4.3")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
@@ -40,6 +40,18 @@ DEEPSKY_CSV = os.environ.get("DEEPSKY_CSV", "/opt/astap/deep_sky.csv")
 # add-on options (solve_timeout) through this env var.
 SOLVE_TIMEOUT = int(os.environ.get("SOLVE_TIMEOUT", "600") or 600)
 
+# Track in-flight ASTAP subprocesses. A steadily rising active count means
+# solves are being started faster than they finish (e.g. a client retrying a
+# slow dense-starfield image) — the prime suspect for climbing CPU.
+_active_solves = 0
+_request_seq = 0
+
+
+def _next_request_id() -> int:
+    global _request_seq
+    _request_seq += 1
+    return _request_seq
+
 
 async def _run_astap(cmd: list, timeout: int = SOLVE_TIMEOUT) -> tuple:
     """Run astap_cli without blocking the event loop. Returns (output, rc).
@@ -50,20 +62,25 @@ async def _run_astap(cmd: list, timeout: int = SOLVE_TIMEOUT) -> tuple:
 
     Raises asyncio.TimeoutError if the solve exceeds ``timeout`` seconds.
     """
-    LOGGER.info("Running ASTAP: %s", " ".join(cmd))
+    global _active_solves
+    _active_solves += 1
+    LOGGER.info("Running ASTAP (%d active): %s", _active_solves, " ".join(cmd))
     start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
+    LOGGER.info("ASTAP pid=%d", proc.pid)
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
+        LOGGER.warning("ASTAP timed out after %ss, killing pid=%d", timeout, proc.pid)
         proc.kill()
         await proc.wait()
-        LOGGER.warning("ASTAP timed out after %ss", timeout)
         raise
+    finally:
+        _active_solves -= 1
     elapsed = time.monotonic() - start
     output = stdout.decode(errors="ignore")
     LOGGER.info("ASTAP finished rc=%s in %.1fs", proc.returncode, elapsed)
@@ -230,6 +247,9 @@ def health():
         # Deep sky annotation catalogue (baked into the image).
         "deepsky_db": Path(DEEPSKY_CSV).exists(),
         "deepsky_objects": len(_DEEPSKY_OBJECTS),
+        # Number of ASTAP solves currently running. Should return to 0 between
+        # requests; a persistently non-zero value points at stuck/orphaned solves.
+        "active_solves": _active_solves,
     }
 
 
@@ -372,21 +392,30 @@ async def solve_stream(
     img_path = d / f"input{suffix}"
     if not img_path.exists():
         raise HTTPException(404, "no uploaded file for this upload_id")
+    rid = _next_request_id()
+    blind = ra is None or dec is None
     LOGGER.info(
-        "/solve_stream '%s' (%.1f MB) id=%s, hints ra=%s dec=%s fov=%s annotate=%s",
-        filename, img_path.stat().st_size / 1e6, upload_id, ra, dec, fov, annotate,
+        "[#%d] /solve_stream '%s' (%.1f MB) id=%s hints ra=%s dec=%s fov=%s "
+        "radius=%s annotate=%s %s",
+        rid, filename, img_path.stat().st_size / 1e6, upload_id, ra, dec, fov,
+        radius, annotate, "BLIND-SOLVE" if blind else "hinted",
     )
 
     async def stream():
+        global _active_solves
         cmd = _build_cmd(img_path, ra, dec, fov, radius)
-        LOGGER.info("Running ASTAP: %s", " ".join(cmd))
+        proc = None
         start = time.monotonic()
+        _active_solves += 1
+        LOGGER.info("[#%d] Running ASTAP (%d active): %s",
+                    rid, _active_solves, " ".join(cmd))
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
+            LOGGER.info("[#%d] ASTAP pid=%d", rid, proc.pid)
             captured = []
             try:
                 while True:
@@ -398,29 +427,43 @@ async def solve_stream(
                     line = raw.decode(errors="ignore").rstrip()
                     if line:
                         captured.append(line)
-                        LOGGER.info("astap| %s", line)
+                        LOGGER.info("[#%d] astap| %s", rid, line)
                         yield json.dumps({"type": "log", "line": line}) + "\n"
                 await proc.wait()
             except asyncio.TimeoutError:
-                proc.kill()
-                LOGGER.warning("/solve_stream timed out after %ss", SOLVE_TIMEOUT)
+                LOGGER.warning("[#%d] timed out after %ss, killing pid=%d",
+                               rid, SOLVE_TIMEOUT, proc.pid)
                 yield json.dumps({"type": "error", "message": f"solve timed out after {SOLVE_TIMEOUT}s"}) + "\n"
                 return
 
-            LOGGER.info("ASTAP finished rc=%s in %.1fs", proc.returncode,
-                        time.monotonic() - start)
+            LOGGER.info("[#%d] ASTAP finished rc=%s in %.1fs", rid,
+                        proc.returncode, time.monotonic() - start)
             solution, error = _solution_or_error(
                 img_path, "\n".join(captured), proc.returncode, annotate
             )
             if error:
-                LOGGER.warning("/solve_stream failed: %s", error.get("astap_error"))
+                LOGGER.warning("[#%d] failed: %s", rid, error.get("astap_error"))
                 yield json.dumps({"type": "error", **error}) + "\n"
             else:
                 n = len(solution.get("objects", [])) if annotate else "-"
-                LOGGER.info("/solve_stream solved: ra=%.4f dec=%.4f objects=%s",
+                LOGGER.info("[#%d] solved: ra=%.4f dec=%.4f objects=%s", rid,
                             solution["ra_deg"], solution["dec_deg"], n)
                 yield json.dumps({"type": "result", "data": solution}) + "\n"
         finally:
+            _active_solves -= 1
+            # Kill the subprocess if it is still alive — e.g. the client
+            # disconnected (GeneratorExit) or timed out. Without this the
+            # orphaned astap_cli keeps burning CPU and, with retries, they
+            # stack up: exactly the "CPU climbing" symptom.
+            if proc is not None and proc.returncode is None:
+                LOGGER.warning("[#%d] terminating orphaned ASTAP pid=%d "
+                               "(%d still active)", rid, proc.pid,
+                               _active_solves)
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
             # Clean up the staging directory regardless of outcome.
             try:
                 for p in d.iterdir():
