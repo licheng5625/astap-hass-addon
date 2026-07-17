@@ -9,15 +9,24 @@ simple ``KEY=VALUE`` lines. ``PLTSOLVD=T`` marks a successful solve.
 """
 import asyncio
 import json
+import logging
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="ASTAP Plate Solver", version="0.4.1")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+LOGGER = logging.getLogger("astap")
+
+app = FastAPI(title="ASTAP Plate Solver", version="0.4.2")
 
 STAR_DB_DIR = os.environ.get("STAR_DB_DIR", "/share/astap_star_db")
 SEARCH_RADIUS = os.environ.get("SEARCH_RADIUS", "30")
@@ -41,6 +50,8 @@ async def _run_astap(cmd: list, timeout: int = SOLVE_TIMEOUT) -> tuple:
 
     Raises asyncio.TimeoutError if the solve exceeds ``timeout`` seconds.
     """
+    LOGGER.info("Running ASTAP: %s", " ".join(cmd))
+    start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -51,8 +62,15 @@ async def _run_astap(cmd: list, timeout: int = SOLVE_TIMEOUT) -> tuple:
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        LOGGER.warning("ASTAP timed out after %ss", timeout)
         raise
-    return stdout.decode(errors="ignore"), proc.returncode
+    elapsed = time.monotonic() - start
+    output = stdout.decode(errors="ignore")
+    LOGGER.info("ASTAP finished rc=%s in %.1fs", proc.returncode, elapsed)
+    for line in output.splitlines():
+        if line.strip():
+            LOGGER.info("astap| %s", line.rstrip())
+    return output, proc.returncode
 
 
 # --- Deep sky object annotation --------------------------------------------
@@ -180,6 +198,8 @@ def _find_objects_in_field(ra_deg, dec_deg, fov_w_deg, fov_h_deg) -> list:
 
 # Load the catalogue once, at import time.
 _DEEPSKY_OBJECTS = _load_deepsky()
+LOGGER.info("Deep sky catalogue: %d objects loaded from %s",
+            len(_DEEPSKY_OBJECTS), DEEPSKY_CSV)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -270,7 +290,12 @@ async def solve(
     suffix = Path(file.filename or "image.fits").suffix or ".fits"
     with tempfile.TemporaryDirectory() as tmp:
         img_path = Path(tmp) / f"input{suffix}"
-        img_path.write_bytes(await file.read())
+        data = await file.read()
+        img_path.write_bytes(data)
+        LOGGER.info(
+            "/solve received '%s' (%.1f MB), hints ra=%s dec=%s fov=%s annotate=%s",
+            file.filename, len(data) / 1e6, ra, dec, fov, annotate,
+        )
 
         cmd = _build_cmd(img_path, ra, dec, fov, radius)
         try:
@@ -282,7 +307,13 @@ async def solve(
             img_path, output, returncode, annotate
         )
         if error:
+            LOGGER.warning("/solve failed: %s", error.get("astap_error"))
             raise HTTPException(422, error)
+        n = len(solution.get("objects", [])) if annotate else "-"
+        LOGGER.info(
+            "/solve solved: ra=%.4f dec=%.4f objects=%s",
+            solution["ra_deg"], solution["dec_deg"], n,
+        )
         return solution
 
 
@@ -316,6 +347,8 @@ async def upload_chunk(
     mode = "wb" if index == 0 else "ab"
     with open(staging, mode) as f:
         f.write(await chunk.read())
+    if index == 0:
+        LOGGER.info("/upload started '%s' (id=%s)", filename, upload_id)
     return {"upload_id": upload_id, "index": index, "size": staging.stat().st_size}
 
 
@@ -339,9 +372,15 @@ async def solve_stream(
     img_path = d / f"input{suffix}"
     if not img_path.exists():
         raise HTTPException(404, "no uploaded file for this upload_id")
+    LOGGER.info(
+        "/solve_stream '%s' (%.1f MB) id=%s, hints ra=%s dec=%s fov=%s annotate=%s",
+        filename, img_path.stat().st_size / 1e6, upload_id, ra, dec, fov, annotate,
+    )
 
     async def stream():
         cmd = _build_cmd(img_path, ra, dec, fov, radius)
+        LOGGER.info("Running ASTAP: %s", " ".join(cmd))
+        start = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -359,19 +398,27 @@ async def solve_stream(
                     line = raw.decode(errors="ignore").rstrip()
                     if line:
                         captured.append(line)
+                        LOGGER.info("astap| %s", line)
                         yield json.dumps({"type": "log", "line": line}) + "\n"
                 await proc.wait()
             except asyncio.TimeoutError:
                 proc.kill()
+                LOGGER.warning("/solve_stream timed out after %ss", SOLVE_TIMEOUT)
                 yield json.dumps({"type": "error", "message": f"solve timed out after {SOLVE_TIMEOUT}s"}) + "\n"
                 return
 
+            LOGGER.info("ASTAP finished rc=%s in %.1fs", proc.returncode,
+                        time.monotonic() - start)
             solution, error = _solution_or_error(
                 img_path, "\n".join(captured), proc.returncode, annotate
             )
             if error:
+                LOGGER.warning("/solve_stream failed: %s", error.get("astap_error"))
                 yield json.dumps({"type": "error", **error}) + "\n"
             else:
+                n = len(solution.get("objects", [])) if annotate else "-"
+                LOGGER.info("/solve_stream solved: ra=%.4f dec=%.4f objects=%s",
+                            solution["ra_deg"], solution["dec_deg"], n)
                 yield json.dumps({"type": "result", "data": solution}) + "\n"
         finally:
             # Clean up the staging directory regardless of outcome.
